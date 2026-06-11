@@ -1,0 +1,141 @@
+# Demo pipeline: build the app on a private ephemeral runner, sign it in-account,
+# then deploy it behind the ALB *only if* its signature verifies.
+#
+# Two jobs, so each runs on its OWN single-use Fargate runner:
+#   build  -> rootless BuildKit build, push to ECR, cosign+KMS sign, SBOM, verify
+#   deploy -> independent cosign verify (the gate) -> register task def -> update service
+#
+# Triggered by the live demo's control API via workflow_dispatch (and on push to
+# main). runs-on targets our self-hosted labels, so a job only ever gets capacity
+# from the ECS runner plane -- never a GitHub-hosted runner.
+
+name: build-and-deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Why this build was triggered (shown in the demo timeline)"
+        required: false
+        default: "manual"
+  push:
+    branches: [main]
+
+permissions:
+  contents: read           # signing uses an in-account KMS key, not keyless OIDC
+
+concurrency:
+  group: build-deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  ECR_REPOSITORY: demo/app
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  build:
+    runs-on: [self-hosted, ecs, linux, x64]
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+
+      - name: Resolve image reference
+        run: |
+          echo "IMAGE=${ECR_HOST}/${ECR_REPOSITORY}:${IMAGE_TAG}" >> "$GITHUB_ENV"
+          echo "BUILT_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+
+      - name: Build and push (rootless BuildKit -> ECR)
+        run: |
+          buildctl --addr "${BUILDKIT_HOST}" build \
+            --frontend dockerfile.v0 \
+            --local context=app \
+            --local dockerfile=app \
+            --opt build-arg:GIT_SHA=${IMAGE_TAG} \
+            --opt build-arg:BUILT_AT=${BUILT_AT} \
+            --output type=image,name=${IMAGE},push=true \
+            --export-cache type=inline
+
+      - name: Resolve pushed digest
+        id: push
+        run: |
+          DIGEST=$(aws ecr describe-images --repository-name "${ECR_REPOSITORY}" \
+            --image-ids imageTag="${IMAGE_TAG}" \
+            --query 'imageDetails[0].imageDigest' --output text)
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Pushed ${ECR_REPOSITORY}@${DIGEST}"
+
+      - name: Generate SBOM
+        run: syft "${ECR_HOST}/${ECR_REPOSITORY}@${{ steps.push.outputs.digest }}" -o spdx-json > sbom.spdx.json
+
+      - name: Sign image (cosign + AWS KMS, no public tlog)
+        run: cosign sign --yes --tlog-upload=false --key "${SIGNING_KMS_URI}" "${ECR_HOST}/${ECR_REPOSITORY}@${{ steps.push.outputs.digest }}"
+
+      - name: Attest SBOM (KMS-signed, no public tlog)
+        run: |
+          cosign attest --yes --tlog-upload=false --key "${SIGNING_KMS_URI}" \
+            --predicate sbom.spdx.json --type spdxjson \
+            "${ECR_HOST}/${ECR_REPOSITORY}@${{ steps.push.outputs.digest }}"
+
+      - name: Verify in-pipeline before release
+        run: cosign verify --insecure-ignore-tlog=true --key "${SIGNING_KMS_URI}" "${ECR_HOST}/${ECR_REPOSITORY}@${{ steps.push.outputs.digest }}"
+
+  deploy:
+    needs: build
+    runs-on: [self-hosted, ecs, linux, x64]
+    steps:
+      - name: Deploy-time signature gate
+        # The real control: only a signed, runner-built image is allowed to
+        # update the running service. If this fails, the deploy stops here.
+        run: |
+          cosign verify --insecure-ignore-tlog=true --key "${SIGNING_KMS_URI}" \
+            "${ECR_HOST}/${ECR_REPOSITORY}@${{ needs.build.outputs.digest }}"
+
+      - name: Read deploy config (written by Terraform)
+        run: |
+          PREFIX=/gha-demo/deploy
+          for k in cluster service task_family container_name exec_role_arn task_role_arn log_group subnet_ids security_group; do
+            v=$(aws ssm get-parameter --name "${PREFIX}/${k}" --query 'Parameter.Value' --output text)
+            echo "DEPLOY_$(echo $k | tr a-z A-Z)=${v}" >> "$GITHUB_ENV"
+          done
+
+      - name: Register new task definition (with verified digest + provenance)
+        id: taskdef
+        run: |
+          IMAGE_REF="${ECR_HOST}/${ECR_REPOSITORY}@${{ needs.build.outputs.digest }}"
+          BUILT_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          # Start from the current task def, swap image + provenance env, re-register.
+          aws ecs describe-task-definition --task-definition "${DEPLOY_TASK_FAMILY}" \
+            --query 'taskDefinition' --output json > base.json
+          jq --arg img "$IMAGE_REF" \
+             --arg digest "${{ needs.build.outputs.digest }}" \
+             --arg sha "${IMAGE_TAG}" \
+             --arg built "$BUILT_AT" \
+             --arg cname "$DEPLOY_CONTAINER_NAME" '
+            .containerDefinitions |= map(
+              if .name == $cname then
+                .image = $img |
+                .environment = ((.environment // []) | map(select(.name|test("^(IMAGE_DIGEST|GIT_SHA|BUILT_AT|COSIGN_VERIFIED)$")|not)))
+                  + [{"name":"IMAGE_DIGEST","value":$digest},
+                     {"name":"GIT_SHA","value":$sha},
+                     {"name":"BUILT_AT","value":$built},
+                     {"name":"COSIGN_VERIFIED","value":"true"}]
+              else . end)
+            | {family,taskRoleArn,executionRoleArn,networkMode,containerDefinitions,requiresCompatibilities,cpu,memory,runtimePlatform}
+            | with_entries(select(.value != null))
+          ' base.json > new.json
+          NEW_ARN=$(aws ecs register-task-definition --cli-input-json file://new.json \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "arn=${NEW_ARN}" >> "$GITHUB_OUTPUT"
+          echo "Registered ${NEW_ARN}"
+
+      - name: Roll the service to the verified image
+        run: |
+          aws ecs update-service \
+            --cluster "${DEPLOY_CLUSTER}" \
+            --service "${DEPLOY_SERVICE}" \
+            --task-definition "${{ steps.taskdef.outputs.arn }}" \
+            --force-new-deployment >/dev/null
+          aws ecs wait services-stable --cluster "${DEPLOY_CLUSTER}" --services "${DEPLOY_SERVICE}"
+          echo "Service ${DEPLOY_SERVICE} is stable on the verified image."
