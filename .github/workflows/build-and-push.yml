@@ -24,10 +24,6 @@ on:
 permissions:
   contents: read           # signing uses an in-account KMS key, not keyless OIDC
 
-concurrency:
-  group: build-deploy-${{ github.ref }}
-  cancel-in-progress: false
-
 env:
   ECR_REPOSITORY: demo/app
   IMAGE_TAG: ${{ github.sha }}
