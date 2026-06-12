@@ -132,6 +132,7 @@ jobs:
             --cluster "${DEPLOY_CLUSTER}" \
             --service "${DEPLOY_SERVICE}" \
             --task-definition "${{ steps.taskdef.outputs.arn }}" \
+            --desired-count 1 \
             --force-new-deployment >/dev/null
           aws ecs wait services-stable --cluster "${DEPLOY_CLUSTER}" --services "${DEPLOY_SERVICE}"
           echo "Service ${DEPLOY_SERVICE} is stable on the verified image."
